@@ -1,83 +1,102 @@
+// src/index.ts
+// Fixed version with proper module loading for ts-node
+
 import {
+  ChatInputCommandInteraction,
   Client,
   Collection,
-  GatewayIntentBits,
   Events,
-  type ChatInputCommandInteraction,
-  type SlashCommandBuilder,
+  GatewayIntentBits,
+  SlashCommandBuilder,
 } from "discord.js";
 import { config } from "dotenv";
-import fs from "fs";
-import path from "path";
+import fs from "node:fs";
+import path from "node:path";
 
-config();
-
-export interface SlashCommand {
+export interface Command {
   data: SlashCommandBuilder;
   execute: (interaction: ChatInputCommandInteraction) => Promise<void>;
 }
 
-// ---- Type augmentation ----
-declare module "discord.js" {
-  interface Client {
-    commands: Collection<string, SlashCommand>;
-  }
+interface ExtendedClient extends Client {
+  commands: Collection<string, Command>;
 }
 
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-});
+config();
 
-client.commands = new Collection();
+if (!process.env.DISCORD_TOKEN) {
+  throw new Error("DISCORD_TOKEN is not defined in .env");
+}
 
-// Load commands (.ts)
+const client: ExtendedClient = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildPresences,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
+}) as ExtendedClient;
+
+client.commands = new Collection<string, Command>();
+
 const commandsPath = path.join(__dirname, "commands");
-const commandFiles = fs.readdirSync(commandsPath).filter(f => f.endsWith(".ts"));
+const commandFiles = fs
+  .readdirSync(commandsPath)
+  .filter((file) => file.endsWith('.ts') || file.endsWith('.js'));
 
 for (const file of commandFiles) {
-  const command = require(path.join(commandsPath, file));
-  if ("data" in command && "execute" in command) {
-    client.commands.set(command.data.name, command);
-    console.log(`✔ Loaded /${command.data.name}`);
+  const filePath = path.join(commandsPath, file);
+  let commandModule = require(filePath);
+
+  if (commandModule.default) {
+    commandModule = commandModule.default;
+  }
+
+  if ("data" in commandModule && "execute" in commandModule) {
+    client.commands.set(commandModule.data.name, commandModule);
+    console.log(`Loaded command: ${commandModule.data.name}`);
   } else {
-    console.warn(`⚠ Command ${file} is missing data or execute.`);
+    console.warn(`⚠️ Command at ${filePath} is missing required properties.`);
   }
 }
 
-// Ready event
-client.once(Events.ClientReady, ready => {
-  console.log(`🚀 Logged in as ${ready.user.tag}`);
-});
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
 
-// Interaction event with logs
-client.on(Events.InteractionCreate, async i => {
-  console.log("🔵 Interaction received:", {
-    type: i.type,
-    command: i.isChatInputCommand() ? i.commandName : "not a command",
-  });
+  console.log("Interaction received:", interaction.commandName);
 
-  if (!i.isChatInputCommand()) return;
+  const command = client.commands.get(interaction.commandName);
+  console.log("Resolved command =", command ? "OK" : "NOT FOUND");
 
-  const cmd = client.commands.get(i.commandName);
-
-  if (!cmd) {
-    console.log("❌ No command found for", i.commandName);
+  if (!command) {
+    console.error(`No command found for: ${interaction.commandName}`);
     return;
   }
 
-  console.log("🟢 Executing command:", i.commandName);
-
   try {
-    await cmd.execute(i);
-  } catch (err) {
-    console.error("❌ Error while executing command:", err);
-    try {
-      await i.reply({
-        content: "❌ Internal error.",
+    console.log(`Executing command: ${interaction.commandName}`);
+    await command.execute(interaction);
+    console.log("Command finished successfully");
+  } catch (error) {
+    console.error("Error in execute():", error);
+
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp({
+        content: "❌ An error occurred.",
         ephemeral: true,
       });
-    } catch {}
+    } else {
+      await interaction.reply({
+        content: "❌ An error occurred.",
+        ephemeral: true,
+      });
+    }
   }
 });
 
-client.login(process.env.TOKEN);
+client.once(Events.ClientReady, (c) => {
+  console.log(`Logged in as ${c.user.tag}`);
+});
+
+client.login(process.env.DISCORD_TOKEN);
